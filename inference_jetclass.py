@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import torch
 import uproot
 import numpy as np
@@ -47,96 +48,112 @@ class DummyDataConfig:
 
 data_config = DummyDataConfig()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model, _ = get_model(data_config, num_classes=data_config.num_classes, export_embed=True)
-model.eval().to(device)
+def main():
+    parser = argparse.ArgumentParser(description="Run inference and save embeddings to CSV")
+    parser.add_argument('-o', '--output', default='HToCC_inference_with_embedding.csv',
+                        help='output CSV file path')
+    parser.add_argument('--root-dir', default=root_dir,
+                        help='root directory to join with provided data file names')
+    parser.add_argument('data_files', nargs='+', help='list of root files (names) or full paths')
+    args = parser.parse_args()
 
-output_csv_path = "HToCC_inference_with_embedding.csv"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = get_model(data_config, num_classes=data_config.num_classes, export_embed=True)
+    model.eval().to(device)
 
-with open(output_csv_path, mode="w", newline="") as csvfile:
-    writer = csv.writer(csvfile)
+    output_csv_path = "HToCC_inference_with_embedding.csv"
 
-    # deleted probs columns, only keep embedding
-    base_header = (
-        ["file", "event_index"] +
-        ["truth_label", "label_name",
-         "jet_sdmass", "jet_mass", "jet_pt", "jet_eta", "jet_phi"]
-    )
-    emb_header = [f"emb_{j}" for j in range(128)]
-    writer.writerow(base_header + emb_header)
+    with open(output_csv_path, mode="w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
 
-    for file_name in root_files:
-        print(f"\nRunning inference on: {file_name}")
-        file_path = os.path.join(root_dir, file_name)
-        with uproot.open(file_path) as f:
-            tree = f["tree"]
-            arrays = tree.arrays(pf_keys, library="np")
+        # deleted probs columns, only keep embedding
+        base_header = (
+            ["file", "event_index"] +
+            ["truth_label", "label_name",
+            "jet_sdmass", "jet_mass", "jet_pt", "jet_eta", "jet_phi"]
+        )
+        emb_header = [f"emb_{j}" for j in range(128)]
+        writer.writerow(base_header + emb_header)
 
-        max_part = 128
-        total_events = len(arrays["part_px"])
+        for file_name in args.data_files:
+            print(f"\nRunning inference on: {file_name}")
+            # Try file_name as-is first; if not found, join with root_dir
+            if os.path.exists(file_name):
+                file_path = file_name
+            else:
+                file_path = os.path.join(args.root_dir, file_name)
+            with uproot.open(file_path) as f:
+                tree = f["tree"]
+                arrays = tree.arrays(pf_keys, library="np")
 
-        for i in tqdm(range(total_events), desc=f"{file_name}"):
-            try:
-                n_part = arrays["part_px"][i].shape[0]
-                if n_part > max_part:
+            max_part = 128
+            total_events = len(arrays["part_px"])
+
+            for i in tqdm(range(total_events), desc=f"{file_name}"):
+                try:
+                    n_part = arrays["part_px"][i].shape[0]
+                    if n_part > max_part:
+                        continue
+
+                    # build input tensor
+                    particle_feats = [arrays[k][i] for k in particle_keys]
+                    scalar_feats = [np.full(n_part, arrays[k][i]) for k in scalar_keys]
+                    all_feats = particle_feats + scalar_feats
+                    pf_features = np.stack(all_feats, axis=1).astype(np.float32)
+
+                    padded = np.zeros((max_part, pf_features.shape[1]), dtype=np.float32)
+                    padded[:n_part, :] = pf_features
+
+                    jet_tensor = torch.tensor(padded, dtype=torch.float32).unsqueeze(0).to(device)
+                    lorentz_vectors = jet_tensor[:, :, 0:4].transpose(1, 2)
+                    features = jet_tensor[:, :, 4:].transpose(1, 2)
+                    mask = (jet_tensor.sum(dim=2) != 0).unsqueeze(1)
+                    points = None
+
+                    with torch.no_grad():
+                        out = model(points, features, lorentz_vectors, mask)
+
+                    # fix to support both (logits, embedding) and embedding-only
+                    if isinstance(out, tuple):
+                        logits, embedding = out
+                    else:
+                        logits, embedding = None, out
+
+                    embedding = embedding.squeeze(0).detach().cpu().numpy()
+
+                    # truth labels
+                    label_array = np.array([arrays[k][i] for k in [
+                        'label_QCD', 'label_Hbb', 'label_Hcc', 'label_Hgg',
+                        'label_H4q', 'label_Hqql', 'label_Zqq', 'label_Wqq',
+                        'label_Tbqq', 'label_Tbl'
+                    ]])
+                    truth_label = int(np.argmax(label_array))
+                    label_names = ["QCD","Hbb","Hcc","Hgg","H4q","Hqql","Zqq","Wqq","Tbqq","Tbl"]
+                    label_name = label_names[truth_label]
+
+                    # softdrop + ungroomed mass
+                    jet_sdmass = float(arrays["jet_sdmass"][i])
+                    pt  = float(arrays["jet_pt"][i])
+                    eta = float(arrays["jet_eta"][i])
+                    phi = float(arrays["jet_phi"][i])
+                    E   = float(arrays["jet_energy"][i])
+
+                    px = pt * cos(phi)
+                    py = pt * sin(phi)
+                    pz = pt * sinh(eta)
+                    p2 = px*px + py*py + pz*pz
+                    m2 = max(E*E - p2, 0.0)
+                    jet_mass = float(np.sqrt(m2))
+
+                    row = [os.path.basename(file_name), i, truth_label, label_name,
+                           jet_sdmass, jet_mass, pt, eta, phi] + list(embedding)
+                    writer.writerow(row)
+
+                except Exception as e:
+                    print(f"Error in event {i}: {e}")
                     continue
 
-                # build input tensor
-                particle_feats = [arrays[k][i] for k in particle_keys]
-                scalar_feats = [np.full(n_part, arrays[k][i]) for k in scalar_keys]
-                all_feats = particle_feats + scalar_feats
-                pf_features = np.stack(all_feats, axis=1).astype(np.float32)
+    print(f"Saved CSV data to {output_csv_path}")
 
-                padded = np.zeros((max_part, pf_features.shape[1]), dtype=np.float32)
-                padded[:n_part, :] = pf_features
-
-                jet_tensor = torch.tensor(padded, dtype=torch.float32).unsqueeze(0).to(device)
-                lorentz_vectors = jet_tensor[:, :, 0:4].transpose(1, 2)
-                features = jet_tensor[:, :, 4:].transpose(1, 2)
-                mask = (jet_tensor.sum(dim=2) != 0).unsqueeze(1)
-                points = None
-
-                with torch.no_grad():
-                    out = model(points, features, lorentz_vectors, mask)
-
-                # fix to support both (logits, embedding) and embedding-only
-                if isinstance(out, tuple):
-                    logits, embedding = out
-                else:
-                    logits, embedding = None, out
-
-                embedding = embedding.squeeze(0).detach().cpu().numpy()
-
-                # truth labels
-                label_array = np.array([arrays[k][i] for k in [
-                    'label_QCD', 'label_Hbb', 'label_Hcc', 'label_Hgg',
-                    'label_H4q', 'label_Hqql', 'label_Zqq', 'label_Wqq',
-                    'label_Tbqq', 'label_Tbl'
-                ]])
-                truth_label = int(np.argmax(label_array))
-                label_names = ["QCD","Hbb","Hcc","Hgg","H4q","Hqql","Zqq","Wqq","Tbqq","Tbl"]
-                label_name = label_names[truth_label]
-
-                # softdrop + ungroomed mass
-                jet_sdmass = float(arrays["jet_sdmass"][i])
-                pt  = float(arrays["jet_pt"][i])
-                eta = float(arrays["jet_eta"][i])
-                phi = float(arrays["jet_phi"][i])
-                E   = float(arrays["jet_energy"][i])
-
-                px = pt * cos(phi)
-                py = pt * sin(phi)
-                pz = pt * sinh(eta)
-                p2 = px*px + py*py + pz*pz
-                m2 = max(E*E - p2, 0.0)
-                jet_mass = float(np.sqrt(m2))
-
-                row = [file_name, i, truth_label, label_name,
-                       jet_sdmass, jet_mass, pt, eta, phi] + list(embedding)
-                writer.writerow(row)
-
-            except Exception as e:
-                print(f"Error in event {i}: {e}")
-                continue
-
-print(f"Saved CSV data to {output_csv_path}")
+if __name__ == '__main__':
+    main()
