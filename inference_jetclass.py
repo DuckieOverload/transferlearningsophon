@@ -61,19 +61,20 @@ def main():
     model, _ = get_model(data_config, num_classes=data_config.num_classes, export_embed=True)
     model.eval().to(device)
 
-    output_csv_path = "HToCC_inference_with_embedding.csv"
+    output_csv_path = args.output
 
     with open(output_csv_path, mode="w", newline="") as csvfile:
         writer = csv.writer(csvfile)
 
-        # deleted probs columns, only keep embedding
+        # include probability columns and embeddings
         base_header = (
             ["file", "event_index"] +
             ["truth_label", "label_name",
             "jet_sdmass", "jet_mass", "jet_pt", "jet_eta", "jet_phi"]
         )
+        prob_header = [f"prob_{i}" for i in range(10)]
         emb_header = [f"emb_{j}" for j in range(128)]
-        writer.writerow(base_header + emb_header)
+        writer.writerow(base_header + prob_header + emb_header)
 
         for file_name in args.data_files:
             print(f"\nRunning inference on: {file_name}")

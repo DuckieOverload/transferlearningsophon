@@ -1,3 +1,4 @@
 data/
 networks/
 .DS_Store
+*.csv
