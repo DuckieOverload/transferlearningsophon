@@ -1,8 +1,10 @@
 # Data files - too large for GitHub
+data/
 val_5M/
 embeddings/
 networks/
 *.root
+*.csv
 
 # Python
 __pycache__/
